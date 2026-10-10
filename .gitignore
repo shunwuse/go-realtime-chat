@@ -1,0 +1,20 @@
+# binaries
+*.exe
+*.out
+gateway/gateway
+chatservice/chatservice
+bots/bots
+
+# build cache
+bin/
+dist/
+
+# test artifacts
+*.test
+*.prof
+coverage.out
+
+# ide
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,11 @@
+services:
+  chatservice:
+    build: ./chatservice
+    ports: ["50051:50051"]
+  gateway:
+    build: ./gateway
+    ports: ["8080:8080"]
+    depends_on: [chatservice]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
