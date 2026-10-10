@@ -1,0 +1,6 @@
+version: v2
+lint:
+  use:
+    - STANDARD
+  except:
+    - RPC_RESPONSE_STANDARD_NAME

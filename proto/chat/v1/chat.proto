@@ -1,0 +1,25 @@
+syntax = "proto3";
+package chat.v1;
+
+option go_package = "example.com/chat/proto/gen/chat/v1;chatv1";
+
+service ChatService {
+  rpc Send(SendRequest) returns (SendResponse);
+  rpc GetHistory(GetHistoryRequest) returns (GetHistoryResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream ChatEvent);
+}
+
+message SendRequest { string room_id = 1; string from = 2; string body = 3; }
+
+message SendResponse { int64 event_id = 1; }
+
+message GetHistoryRequest { string room_id = 1; int64 since_event_id = 2; int32 limit = 3; }
+
+message GetHistoryResponse { repeated ChatEvent events = 1; }
+
+message SubscribeRequest { string room_id = 1; }
+
+message ChatEvent {
+  string room_id         = 1; string from = 2; string body = 3;
+  int64  sent_at_unix_ms = 4; int64 event_id = 5;
+}
