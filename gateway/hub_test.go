@@ -139,7 +139,11 @@ func serve(t *testing.T) (string, pb.ChatServiceClient) {
 
 	hub := NewHub()
 	go hub.Run()
-	subs := newSubscriptions(hub, chat)
+	t.Cleanup(hub.Stop)
+	// Loops die with the test so goleak sees a clean slate.
+	loopCtx, stopLoops := context.WithCancel(context.Background())
+	t.Cleanup(stopLoops)
+	subs := newSubscriptions(loopCtx, hub, chat)
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		serveWS(hub, chat, subs, w, request)
 	}))

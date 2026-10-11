@@ -1,5 +1,9 @@
 package main
 
+import (
+	"sync"
+)
+
 // Client is one browser WebSocket connection.
 // send is buffered (256): a slow client is dropped, never blocking the Hub.
 type Client struct {
@@ -22,6 +26,8 @@ type Hub struct {
 	unregister chan *Client
 	broadcast  chan roomMessage
 	rooms      map[string]map[*Client]struct{}
+	done       chan struct{}
+	stopOnce   sync.Once
 }
 
 func NewHub() *Hub {
@@ -30,13 +36,24 @@ func NewHub() *Hub {
 		unregister: make(chan *Client),
 		broadcast:  make(chan roomMessage, 256),
 		rooms:      make(map[string]map[*Client]struct{}),
+		done:       make(chan struct{}),
 	}
+}
+
+// Stop shuts the Run loop down. Production never calls it (process lifetime);
+// tests call it in cleanup so goleak sees no leftover Hub.
+func (h *Hub) Stop() {
+	h.stopOnce.Do(func() {
+		close(h.done)
+	})
 }
 
 // Run is the Hub's event loop. Run it once: go hub.Run().
 func (h *Hub) Run() {
 	for {
 		select {
+		case <-h.done:
+			return
 		case c := <-h.register:
 			if h.rooms[c.room] == nil {
 				h.rooms[c.room] = make(map[*Client]struct{})

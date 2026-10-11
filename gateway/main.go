@@ -46,7 +46,7 @@ func main() {
 	hub := NewHub()
 	go hub.Run()
 
-	subs := newSubscriptions(hub, chat)
+	subs := newSubscriptions(context.Background(), hub, chat)
 
 	http.HandleFunc("/", servePage)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, request *http.Request) {
@@ -132,10 +132,13 @@ func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.Re
 		}
 	}
 
-	hub.register <- c
-
 	// First browser in this room opens the Subscribe stream; the rest share it.
+	// Started before register so the loop is already dialing when the client
+	// joins. A message sent within the handshake window can still be missed;
+	// browsers cover it with last_event_id catch-up on their next join.
 	subs.ensure(room)
+
+	hub.register <- c
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -149,20 +152,22 @@ func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.Re
 type subscriptions struct {
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
+	parent context.Context
 	hub    *Hub
 	chat   pb.ChatServiceClient
 }
 
-func newSubscriptions(hub *Hub, chat pb.ChatServiceClient) *subscriptions {
+func newSubscriptions(parent context.Context, hub *Hub, chat pb.ChatServiceClient) *subscriptions {
 	return &subscriptions{
 		active: make(map[string]context.CancelFunc),
+		parent: parent,
 		hub:    hub,
 		chat:   chat,
 	}
 }
 
 // ensure starts the room loop once; later calls are no-ops.
-// Loops live on context.Background: they outlive any single browser.
+// Loops follow the parent context: process lifetime in main, test scope in tests.
 func (s *subscriptions) ensure(room string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -171,7 +176,7 @@ func (s *subscriptions) ensure(room string) {
 		return
 	}
 
-	loopCtx, cancel := context.WithCancel(context.Background())
+	loopCtx, cancel := context.WithCancel(s.parent)
 	s.active[room] = cancel
 
 	go subscribeLoop(loopCtx, s.hub, s.chat, room)
