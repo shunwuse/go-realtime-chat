@@ -26,6 +26,7 @@ type fakeChatServer struct {
 	pb.UnimplementedChatServiceServer
 	mu     sync.Mutex
 	events []*pb.ChatEvent
+	subs   map[string]map[chan *pb.ChatEvent]struct{}
 	nextID atomic.Int64
 }
 
@@ -47,6 +48,13 @@ func (f *fakeChatServer) Send(ctx context.Context, request *pb.SendRequest) (*pb
 	defer f.mu.Unlock()
 
 	f.events = append(f.events, event)
+
+	for ch := range f.subs[request.GetRoomId()] {
+		select {
+		case ch <- event:
+		default:
+		}
+	}
 
 	return &pb.SendResponse{EventId: id}, nil
 }
@@ -71,6 +79,39 @@ func (f *fakeChatServer) GetHistory(ctx context.Context, request *pb.GetHistoryR
 	}
 
 	return &pb.GetHistoryResponse{Events: missed}, nil
+}
+
+func (f *fakeChatServer) Subscribe(request *pb.SubscribeRequest, stream pb.ChatService_SubscribeServer) error {
+	ch := make(chan *pb.ChatEvent, 64)
+	room := request.GetRoomId()
+
+	f.mu.Lock()
+	if f.subs == nil {
+		f.subs = make(map[string]map[chan *pb.ChatEvent]struct{})
+	}
+	if f.subs[room] == nil {
+		f.subs[room] = make(map[chan *pb.ChatEvent]struct{})
+	}
+	f.subs[room][ch] = struct{}{}
+	f.mu.Unlock()
+
+	defer func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		delete(f.subs[room], ch)
+	}()
+
+	for {
+		select {
+		case event := <-ch:
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
 }
 
 // serve starts a real HTTP server wired to a fake chatservice.
@@ -98,8 +139,9 @@ func serve(t *testing.T) (string, pb.ChatServiceClient) {
 
 	hub := NewHub()
 	go hub.Run()
+	subs := newSubscriptions(hub, chat)
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		serveWS(hub, chat, w, request)
+		serveWS(hub, chat, subs, w, request)
 	}))
 	t.Cleanup(httpServer.Close)
 
@@ -222,5 +264,28 @@ func TestHistoryCatchup(t *testing.T) {
 	event := readEvent(t, rejoin)
 	if event.Body != "two" || event.SentAtUnixMs != 7 {
 		t.Fatalf("catch-up got %+v, want body two with stored timestamp", event)
+	}
+}
+
+// The sender gets exactly one copy: broadcast comes only from the Subscribe loop.
+func TestNoDuplicate(t *testing.T) {
+	url, _ := serve(t)
+	alice := dialWS(t, url, "general", "alice")
+	defer alice.Close(websocket.StatusNormalClosure, "")
+	time.Sleep(200 * time.Millisecond) // let the Subscribe loop connect
+
+	writeBody(t, alice, "once")
+
+	event := readEvent(t, alice)
+	if event.Body != "once" {
+		t.Fatalf("got %+v, want once", event)
+	}
+
+	// A second copy would arrive here; timing out means exactly-once.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	if _, _, err := alice.Read(ctx); err == nil {
+		t.Fatalf("got a duplicate broadcast")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	pb "example.com/chat/proto/gen/chat/v1"
@@ -22,6 +23,10 @@ const (
 	writeTimeout = 10 * time.Second
 	// rpcTimeout bounds every unary call so a stuck chatservice never hangs a browser.
 	rpcTimeout = 2 * time.Second
+	// Reconnect backoff for Subscribe streams: start at 1s, double to 30s max.
+	// Streaming is never retried per-message; the gap is covered by GetHistory catch-up.
+	minBackoff = time.Second
+	maxBackoff = 30 * time.Second
 )
 
 func main() {
@@ -41,9 +46,11 @@ func main() {
 	hub := NewHub()
 	go hub.Run()
 
+	subs := newSubscriptions(hub, chat)
+
 	http.HandleFunc("/", servePage)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, request *http.Request) {
-		serveWS(hub, chat, w, request)
+		serveWS(hub, chat, subs, w, request)
 	})
 
 	log.Println("gateway listening on :8080")
@@ -75,7 +82,7 @@ type wsError struct {
 // serveWS upgrades one browser connection and joins it to a room.
 // Query: /ws?room=<room>&from=<name>[&last_event_id=<n>].
 // With last_event_id, missed events are pushed before joining for live traffic.
-func serveWS(hub *Hub, chat pb.ChatServiceClient, w http.ResponseWriter, r *http.Request) {
+func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.ResponseWriter, r *http.Request) {
 	room := r.URL.Query().Get("room")
 	from := r.URL.Query().Get("from")
 	if room == "" || from == "" {
@@ -127,11 +134,129 @@ func serveWS(hub *Hub, chat pb.ChatServiceClient, w http.ResponseWriter, r *http
 
 	hub.register <- c
 
+	// First browser in this room opens the Subscribe stream; the rest share it.
+	subs.ensure(room)
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	go writePump(ctx, conn, c)
 	readPump(ctx, conn, hub, chat, c)
+}
+
+// subscriptions keeps one Subscribe loop per room, started on demand.
+// Rooms are dynamic (browsers name them), so loops start lazily instead of upfront.
+type subscriptions struct {
+	mu     sync.Mutex
+	active map[string]context.CancelFunc
+	hub    *Hub
+	chat   pb.ChatServiceClient
+}
+
+func newSubscriptions(hub *Hub, chat pb.ChatServiceClient) *subscriptions {
+	return &subscriptions{
+		active: make(map[string]context.CancelFunc),
+		hub:    hub,
+		chat:   chat,
+	}
+}
+
+// ensure starts the room loop once; later calls are no-ops.
+// Loops live on context.Background: they outlive any single browser.
+func (s *subscriptions) ensure(room string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.active[room]; ok {
+		return
+	}
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	s.active[room] = cancel
+
+	go subscribeLoop(loopCtx, s.hub, s.chat, room)
+}
+
+// subscribeLoop holds one Subscribe stream and fans its events into the hub.
+// On stream failure it backs off (1s doubling to 30s) and re-subscribes;
+// the gap is covered by GetHistory catch-up, so events are never retried here.
+func subscribeLoop(ctx context.Context, hub *Hub, chat pb.ChatServiceClient, room string) {
+	backoff := minBackoff
+
+	for {
+		stream, err := chat.Subscribe(ctx, &pb.SubscribeRequest{RoomId: room})
+		if err != nil {
+			log.Printf("subscribe %s: %v (retry in %s)", room, err, backoff)
+
+			if !sleepOrDone(ctx, backoff) {
+				return
+			}
+
+			backoff = nextBackoff(backoff)
+
+			continue
+		}
+
+		// Connected: reset backoff, pump until the stream breaks or we shut down.
+		backoff = minBackoff
+
+		if !pumpStream(ctx, hub, room, stream) {
+			return
+		}
+
+		log.Printf("subscribe %s broke (retry in %s)", room, backoff)
+
+		if !sleepOrDone(ctx, backoff) {
+			return
+		}
+
+		backoff = nextBackoff(backoff)
+	}
+}
+
+// pumpStream forwards one stream into the hub broadcast.
+// It returns false only on shutdown; a broken stream returns true to reconnect.
+func pumpStream(ctx context.Context, hub *Hub, room string, stream pb.ChatService_SubscribeClient) bool {
+	for {
+		event, err := stream.Recv()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+				return true
+			}
+		}
+
+		data, err := json.Marshal(encodeEvent(event))
+		if err != nil {
+			continue
+		}
+
+		hub.broadcast <- roomMessage{room: room, data: data}
+	}
+}
+
+// sleepOrDone waits out the backoff but returns early on shutdown.
+func sleepOrDone(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// nextBackoff doubles until the 30s ceiling.
+func nextBackoff(current time.Duration) time.Duration {
+	if current >= maxBackoff {
+		return maxBackoff
+	}
+
+	return current * 2
 }
 
 // fetchHistory returns missed events encoded as wsOutgoing JSON, oldest first.
@@ -205,13 +330,15 @@ func readPump(ctx context.Context, conn *websocket.Conn, hub *Hub, chat pb.ChatS
 			return
 		}
 
-		handleMessage(ctx, hub, chat, c, data)
+		handleMessage(ctx, chat, c, data)
 	}
 }
 
-// handleMessage stores one browser message via Send, then broadcasts the stored event.
+// handleMessage stores one browser message via Send and reports the result.
+// It never broadcasts: the Subscribe loop is the single broadcast path,
+// so the sender gets exactly one copy like everyone else.
 // Failures go back to the sender only; the room never sees them.
-func handleMessage(ctx context.Context, hub *Hub, chat pb.ChatServiceClient, c *Client, data []byte) {
+func handleMessage(ctx context.Context, chat pb.ChatServiceClient, c *Client, data []byte) {
 	var incoming wsIncoming
 	if err := json.Unmarshal(data, &incoming); err != nil {
 		replyError(c, "message must be JSON like {\"body\":\"hi\"}")
@@ -220,7 +347,7 @@ func handleMessage(ctx context.Context, hub *Hub, chat pb.ChatServiceClient, c *
 	}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
-	response, err := chat.Send(rpcCtx, &pb.SendRequest{
+	_, err := chat.Send(rpcCtx, &pb.SendRequest{
 		RoomId: c.room,
 		From:   c.from,
 		Body:   incoming.Body,
@@ -232,24 +359,6 @@ func handleMessage(ctx context.Context, hub *Hub, chat pb.ChatServiceClient, c *
 
 		return
 	}
-
-	// The stored timestamp lives in chatservice and Send does not return it.
-	// Stamp gateway-observed time instead (milliseconds off server time, fine for display).
-	// Exact server timestamps always arrive via GetHistory catch-up.
-	event, err := json.Marshal(wsOutgoing{
-		EventID:      response.GetEventId(),
-		RoomID:       c.room,
-		From:         c.from,
-		Body:         incoming.Body,
-		SentAtUnixMs: time.Now().UnixMilli(),
-	})
-	if err != nil {
-		replyError(c, "failed to encode event")
-
-		return
-	}
-
-	hub.broadcast <- roomMessage{room: c.room, data: event}
 }
 
 // writePump drains the client's send queue to the browser.
