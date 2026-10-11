@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>chat gateway - manual test</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 16px;
+      font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+      color: #1a1d21;
+      background: #f5f6f7;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+    }
+
+    #status,
+    #hint {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: #4c525a;
+    }
+
+    #status.open {
+      color: #17683a;
+    }
+
+    #status.bad,
+    #hint.bad {
+      color: #a32020;
+    }
+
+    #hint.warn {
+      color: #8a5a00;
+    }
+
+    .bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #6b7178;
+    }
+
+    input,
+    button {
+      font: inherit;
+      padding: 7px 9px;
+      border: 1px solid #c6cad0;
+      border-radius: 6px;
+      background: #fff;
+      color: inherit;
+    }
+
+    input {
+      width: 150px;
+    }
+
+    #msg {
+      flex: 1;
+      min-width: 180px;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+
+    #log {
+      height: 45vh;
+      overflow-y: auto;
+      padding: 10px;
+      border: 1px solid #c6cad0;
+      border-radius: 6px;
+      background: #fff;
+    }
+
+    .msg {
+      display: grid;
+      grid-template-columns: 62px 110px 1fr auto;
+      gap: 10px;
+      padding: 3px 0;
+    }
+
+    .msg+.msg {
+      border-top: 1px solid #eceef0;
+    }
+
+    .msg .t,
+    .msg .who,
+    .msg .id {
+      color: #6b7178;
+      font-size: 12px;
+    }
+
+    .msg.err .m {
+      color: #a32020;
+    }
+
+    #empty {
+      margin: 0;
+      color: #8b9198;
+      font-size: 13px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Chat gateway &mdash; manual test</h1>
+  <p id="status">Not connected. Press Join to open the socket.</p>
+  <div class="bar">
+    <label>Room<input id="room" value="general" autocomplete="off" spellcheck="false"></label>
+    <label>Name<input id="name" autocomplete="off" spellcheck="false"></label>
+    <label>Last event id<input id="last" inputmode="numeric" autocomplete="off" spellcheck="false"></label>
+    <button type="button" id="joinBtn">Join</button>
+  </div>
+  <div id="log">
+    <p id="empty">No messages yet. Press Join, then send a message.</p>
+  </div>
+  <p id="hint"></p>
+  <div class="bar">
+    <input id="msg" placeholder="Message, then press Enter" autocomplete="off" spellcheck="false"><button type="button"
+      id="sendBtn" disabled>Send</button>
+  </div>
+  <script>
+    (function () {
+      var $ = function (id) { return document.getElementById(id); };
+      var room = $("room"), name = $("name"), last = $("last"), msg = $("msg"), log = $("log");
+      var statusEl = $("status"), hintEl = $("hint"), sendBtn = $("sendBtn");
+      var ws = null, hintTimer = null;
+      // Random name on load so two windows almost always differ without typing.
+      var names = ["alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi"];
+      name.value = names[Math.floor(Math.random() * names.length)] + "-" + Math.floor(Math.random() * 100);
+      function say(text, kind) {
+        statusEl.textContent = text;
+        statusEl.className = kind || "";
+        sendBtn.disabled = !ws || ws.readyState !== WebSocket.OPEN;
+      }
+      function hint(text, kind, ms) {
+        hintEl.textContent = text;
+        hintEl.className = kind || "";
+        if (hintTimer) clearTimeout(hintTimer);
+        hintTimer = setTimeout(function () { hintEl.textContent = ""; hintEl.className = ""; }, ms || 5000);
+      }
+
+      function pad(n, w) { var s = String(n); while (s.length < w) s = "0" + s; return s; }
+      function clock(ms) { var d = new Date(ms || Date.now()); return pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2); }
+      function cell(cls, text) { var el = document.createElement("span"); el.className = cls; el.textContent = text; return el; }
+      function addLine(who, text, eventId, isError) {
+        var row = document.createElement("div");
+        row.className = isError ? "msg err" : "msg";
+        row.appendChild(cell("t", clock()));
+        row.appendChild(cell("who", who || "?"));
+        row.appendChild(cell("m", text == null ? "" : String(text)));
+        row.appendChild(cell("id", eventId == null ? "" : "#" + eventId));
+        if ($("empty")) log.removeChild($("empty"));
+        log.appendChild(row);
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function join() {
+        var r = room.value.trim(), n = name.value.trim(), l = last.value.trim();
+        if (!r || !n) { hint("Fill in both the room and the name first.", "warn"); return; }
+        if (l && !/^\d+$/.test(l)) { hint("Last event id must be a number, for example 42.", "warn"); return; }
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
+        var url = "ws://" + location.host + "/ws?room=" + encodeURIComponent(r) + "&from=" + encodeURIComponent(n);
+        url += "&last_event_id=" + encodeURIComponent(l || "0");
+        say("Opening the socket to room " + r + " as " + n + "...");
+        var sock;
+        try { sock = new WebSocket(url); } catch (e) {
+          say("Could not open the socket.", "bad");
+          addLine("gateway", "Could not open the socket: " + e.message, null, true);
+          return;
+        }
+        ws = sock;
+        sock.onopen = function () { say("Connected to room " + r + " as " + n + ".", "open"); msg.focus(); };
+        sock.onmessage = function (e) {
+          var f;
+          try { f = JSON.parse(e.data); } catch (err) { addLine("gateway", "Could not read the frame: " + e.data, null, true); return; }
+          if (f && f.error) { addLine("gateway", f.error, null, true); return; }
+          if (f && f.event_id) last.value = String(f.event_id);
+          addLine(f && f.from, f && f.body, f && f.event_id);
+        };
+        sock.onerror = function () { say("Socket error.", "bad"); hint("Socket error. The browser console has the details.", "bad", 6000); };
+        sock.onclose = function (e) {
+          if (sock !== ws) return;
+          say("Disconnected (code " + (e && e.code) + "). Press Join to reconnect.", "bad");
+          addLine("gateway", "Connection closed, code " + (e && e.code) + ".", null, true);
+        };
+      }
+      function send() {
+        var text = msg.value;
+        if (!text.trim()) { hint("Type a message before sending.", "warn"); return; }
+        if (!ws || ws.readyState !== WebSocket.OPEN) { hint("Not connected, so there is nowhere to send this. Press Join first.", "warn", 6000); return; }
+        ws.send(JSON.stringify({ body: text }));
+        msg.value = "";
+      }
+      $("joinBtn").addEventListener("click", join);
+      $("sendBtn").addEventListener("click", send);
+      msg.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); send(); } });
+      [room, name, last].forEach(function (el) {
+        el.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); join(); } });
+      });
+      say("Not connected. Press Join to open the socket.");
+    })();
+  </script>
+</body>
+
+</html>
