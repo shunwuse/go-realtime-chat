@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	pb "example.com/chat/proto/gen/chat/v1"
 	"google.golang.org/grpc"
@@ -90,5 +91,47 @@ func TestHistory_Since(t *testing.T) {
 	events := hist.GetEvents()
 	if len(events) != 1 || events[0].GetBody() != "three" {
 		t.Fatalf("since=2 got %d events, want only [three]", len(events))
+	}
+}
+
+func TestSubscribe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := dial(t)
+
+	open := func() pb.ChatService_SubscribeClient {
+		t.Helper()
+		st, err := c.Subscribe(ctx, &pb.SubscribeRequest{RoomId: "general"})
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		return st
+	}
+	s1, s2 := open(), open()
+
+	// Let the server register both subscriptions before sending.
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := c.Send(ctx, &pb.SendRequest{RoomId: "general", From: "alice", Body: "live"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	for i, st := range []pb.ChatService_SubscribeClient{s1, s2} {
+		recv := make(chan *pb.ChatEvent, 1)
+		go func() {
+			ev, err := st.Recv()
+			if err != nil {
+				return
+			}
+			recv <- ev
+		}()
+		select {
+		case ev := <-recv:
+			if ev.GetBody() != "live" {
+				t.Fatalf("sub %d body = %q, want live", i, ev.GetBody())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("sub %d timed out waiting for event", i)
+		}
 	}
 }
