@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
 	pb "example.com/chat/proto/gen/chat/v1"
+	"github.com/coder/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -45,9 +45,9 @@ func serve(t *testing.T) (string, pb.ChatServiceClient) {
 	// Loops die with the test so goleak sees a clean slate.
 	loopCtx, stopLoops := context.WithCancel(context.Background())
 	t.Cleanup(stopLoops)
-	subs := newSubscriptions(loopCtx, hub, chat)
+	roomStreams := newSubscriptions(loopCtx, hub, chat)
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		serveWS(hub, chat, subs, w, request)
+		serveWS(hub, chat, roomStreams, w, request)
 	}))
 	t.Cleanup(httpServer.Close)
 

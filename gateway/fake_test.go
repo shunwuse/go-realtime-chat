@@ -14,10 +14,10 @@ import (
 // It stores what Send receives so GetHistory can replay it.
 type fakeChatServer struct {
 	pb.UnimplementedChatServiceServer
-	mu     sync.Mutex
-	events []*pb.ChatEvent
-	subs   map[string]map[chan *pb.ChatEvent]struct{}
-	nextID atomic.Int64
+	mu          sync.Mutex
+	events      []*pb.ChatEvent
+	subscribers map[string]map[chan *pb.ChatEvent]struct{}
+	nextID      atomic.Int64
 }
 
 func (f *fakeChatServer) Send(ctx context.Context, request *pb.SendRequest) (*pb.SendResponse, error) {
@@ -39,7 +39,7 @@ func (f *fakeChatServer) Send(ctx context.Context, request *pb.SendRequest) (*pb
 
 	f.events = append(f.events, event)
 
-	for ch := range f.subs[request.GetRoomId()] {
+	for ch := range f.subscribers[request.GetRoomId()] {
 		select {
 		case ch <- event:
 		default:
@@ -76,20 +76,20 @@ func (f *fakeChatServer) Subscribe(request *pb.SubscribeRequest, stream pb.ChatS
 	room := request.GetRoomId()
 
 	f.mu.Lock()
-	if f.subs == nil {
-		f.subs = make(map[string]map[chan *pb.ChatEvent]struct{})
+	if f.subscribers == nil {
+		f.subscribers = make(map[string]map[chan *pb.ChatEvent]struct{})
 	}
-	if f.subs[room] == nil {
-		f.subs[room] = make(map[chan *pb.ChatEvent]struct{})
+	if f.subscribers[room] == nil {
+		f.subscribers[room] = make(map[chan *pb.ChatEvent]struct{})
 	}
-	f.subs[room][ch] = struct{}{}
+	f.subscribers[room][ch] = struct{}{}
 	f.mu.Unlock()
 
 	defer func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
-		delete(f.subs[room], ch)
+		delete(f.subscribers[room], ch)
 	}()
 
 	for {

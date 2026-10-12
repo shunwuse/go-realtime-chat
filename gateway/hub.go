@@ -5,26 +5,27 @@ import (
 )
 
 // Client is one browser WebSocket connection.
-// send is buffered (256): a slow client is dropped, never blocking the Hub.
+// outbox is buffered (256): a slow client is dropped, never blocking the Hub.
 type Client struct {
-	hub  *Hub
-	room string
-	from string
-	send chan []byte
+	hub    *Hub
+	room   string
+	from   string
+	outbox chan []byte // hub --> browser: queued frames waiting to be written
 }
 
-// roomMessage is one broadcast unit: raw bytes to every client in room.
-type roomMessage struct {
-	room string
-	data []byte
+// envelope is one broadcast unit: room is the address, payload is the letter.
+// The Hub speaks envelopes internally; translation to bytes happens at the edges.
+type envelope struct {
+	room    string
+	payload []byte
 }
 
 // Hub is the central switchboard: room -> member clients.
 // All state is owned by Run's goroutine; outsiders talk via channels only.
 type Hub struct {
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan roomMessage
+	register   chan *Client  // browsers --> hub: someone joins a room
+	unregister chan *Client  // pumps --> hub: someone disconnects
+	broadcast  chan envelope // loops --> hub: one event to fan out
 	rooms      map[string]map[*Client]struct{}
 	done       chan struct{}
 	stopOnce   sync.Once
@@ -34,7 +35,7 @@ func NewHub() *Hub {
 	return &Hub{
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
-		broadcast:  make(chan roomMessage, 256),
+		broadcast:  make(chan envelope, 256),
 		rooms:      make(map[string]map[*Client]struct{}),
 		done:       make(chan struct{}),
 	}
@@ -54,45 +55,45 @@ func (h *Hub) Run() {
 		select {
 		case <-h.done:
 			return
-		case c := <-h.register:
-			if h.rooms[c.room] == nil {
-				h.rooms[c.room] = make(map[*Client]struct{})
+		case client := <-h.register:
+			if h.rooms[client.room] == nil {
+				h.rooms[client.room] = make(map[*Client]struct{})
 			}
-			h.rooms[c.room][c] = struct{}{}
+			h.rooms[client.room][client] = struct{}{}
 
-		case c := <-h.unregister:
-			h.remove(c)
+		case client := <-h.unregister:
+			h.remove(client)
 
-		case m := <-h.broadcast:
-			for c := range h.rooms[m.room] {
+		case msg := <-h.broadcast:
+			for client := range h.rooms[msg.room] {
 				select {
-				case c.send <- m.data:
+				case client.outbox <- msg.payload:
 				default:
 					// Slow client: drop it so one laggard
 					// never blocks the whole room.
-					h.remove(c)
+					h.remove(client)
 				}
 			}
 		}
 	}
 }
 
-// remove detaches a client and closes its send channel.
+// remove detaches a client and closes its outbox channel.
 // Only Run calls it, so no lock is needed.
-func (h *Hub) remove(c *Client) {
-	members := h.rooms[c.room]
+func (h *Hub) remove(client *Client) {
+	members := h.rooms[client.room]
 	if members == nil {
 		return
 	}
-	if _, ok := members[c]; !ok {
+	if _, ok := members[client]; !ok {
 		return
 	}
 
-	delete(members, c)
+	delete(members, client)
 
-	close(c.send)
+	close(client.outbox)
 
 	if len(members) == 0 {
-		delete(h.rooms, c.room)
+		delete(h.rooms, client.room)
 	}
 }

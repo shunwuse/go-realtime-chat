@@ -42,11 +42,11 @@ func main() {
 	hub := NewHub()
 	go hub.Run()
 
-	subs := newSubscriptions(context.Background(), hub, chat)
+	roomStreams := newSubscriptions(context.Background(), hub, chat)
 
 	http.HandleFunc("/", servePage)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, request *http.Request) {
-		serveWS(hub, chat, subs, w, request)
+		serveWS(hub, chat, roomStreams, w, request)
 	})
 
 	log.Println("gateway listening on :8080")

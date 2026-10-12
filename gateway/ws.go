@@ -34,7 +34,7 @@ type wsError struct {
 // serveWS upgrades one browser connection and joins it to a room.
 // Query: /ws?room=<room>&from=<name>[&last_event_id=<n>].
 // With last_event_id, missed events are pushed before joining for live traffic.
-func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.ResponseWriter, r *http.Request) {
+func serveWS(hub *Hub, chat pb.ChatServiceClient, roomStreams *subscriptions, w http.ResponseWriter, r *http.Request) {
 	room := r.URL.Query().Get("room")
 	from := r.URL.Query().Get("from")
 	if room == "" || from == "" {
@@ -48,11 +48,11 @@ func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.Re
 		return
 	}
 
-	c := &Client{
-		hub:  hub,
-		room: room,
-		from: from,
-		send: make(chan []byte, 256),
+	client := &Client{
+		hub:    hub,
+		room:   room,
+		from:   from,
+		outbox: make(chan []byte, 256),
 	}
 
 	// Catch-up: fill the gap before joining, so the client never misses history.
@@ -76,9 +76,9 @@ func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.Re
 			history = history[len(history)-256:]
 		}
 
-		for _, data := range history {
+		for _, payload := range history {
 			select {
-			case c.send <- data:
+			case client.outbox <- payload:
 			default:
 			}
 		}
@@ -88,15 +88,15 @@ func serveWS(hub *Hub, chat pb.ChatServiceClient, subs *subscriptions, w http.Re
 	// Started before register so the loop is already dialing when the client
 	// joins. A message sent within the handshake window can still be missed;
 	// browsers cover it with last_event_id catch-up on their next join.
-	subs.ensure(room)
+	roomStreams.ensure(room)
 
-	hub.register <- c
+	hub.register <- client
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	go writePump(ctx, conn, c)
-	readPump(ctx, conn, hub, chat, c)
+	go writePump(ctx, conn, client)
+	readPump(ctx, conn, hub, chat, client)
 }
 
 // fetchHistory returns missed events encoded as wsOutgoing JSON, oldest first.
@@ -138,23 +138,23 @@ func encodeEvent(event *pb.ChatEvent) wsOutgoing {
 }
 
 // replyError sends a private error to the sender only, never broadcasting it.
-func replyError(c *Client, message string) {
+func replyError(client *Client, message string) {
 	data, err := json.Marshal(wsError{Error: message})
 	if err != nil {
 		return
 	}
 
 	select {
-	case c.send <- data:
+	case client.outbox <- data:
 	default:
 	}
 }
 
 // readPump forwards browser text messages to chatservice, then broadcasts results.
 // It returns when the browser goes away, then unregisters the client.
-func readPump(ctx context.Context, conn *websocket.Conn, hub *Hub, chat pb.ChatServiceClient, c *Client) {
+func readPump(ctx context.Context, conn *websocket.Conn, hub *Hub, chat pb.ChatServiceClient, client *Client) {
 	defer func() {
-		hub.unregister <- c
+		hub.unregister <- client
 		conn.Close(websocket.StatusNormalClosure, "")
 	}()
 
@@ -170,7 +170,7 @@ func readPump(ctx context.Context, conn *websocket.Conn, hub *Hub, chat pb.ChatS
 			return
 		}
 
-		handleMessage(ctx, chat, c, data)
+		handleMessage(ctx, chat, client, data)
 	}
 }
 
@@ -178,24 +178,24 @@ func readPump(ctx context.Context, conn *websocket.Conn, hub *Hub, chat pb.ChatS
 // It never broadcasts: the Subscribe loop is the single broadcast path,
 // so the sender gets exactly one copy like everyone else.
 // Failures go back to the sender only; the room never sees them.
-func handleMessage(ctx context.Context, chat pb.ChatServiceClient, c *Client, data []byte) {
+func handleMessage(ctx context.Context, chat pb.ChatServiceClient, client *Client, data []byte) {
 	var incoming wsIncoming
 	if err := json.Unmarshal(data, &incoming); err != nil {
-		replyError(c, "message must be JSON like {\"body\":\"hi\"}")
+		replyError(client, "message must be JSON like {\"body\":\"hi\"}")
 
 		return
 	}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	_, err := chat.Send(rpcCtx, &pb.SendRequest{
-		RoomId: c.room,
-		From:   c.from,
+		RoomId: client.room,
+		From:   client.from,
 		Body:   incoming.Body,
 	})
 	cancel()
 
 	if err != nil {
-		replyError(c, err.Error())
+		replyError(client, err.Error())
 
 		return
 	}
@@ -203,13 +203,13 @@ func handleMessage(ctx context.Context, chat pb.ChatServiceClient, c *Client, da
 
 // writePump drains the client's send queue to the browser.
 // It also pings every 30s so dead connections are detected by readPump.
-func writePump(ctx context.Context, conn *websocket.Conn, c *Client) {
+func writePump(ctx context.Context, conn *websocket.Conn, client *Client) {
 	ping := time.NewTicker(pingInterval)
 	defer ping.Stop()
 
 	for {
 		select {
-		case data, ok := <-c.send:
+		case data, ok := <-client.outbox:
 			if !ok {
 				conn.Close(websocket.StatusNormalClosure, "")
 				return

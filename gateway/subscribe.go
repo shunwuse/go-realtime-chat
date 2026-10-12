@@ -101,7 +101,7 @@ func pumpStream(ctx context.Context, hub *Hub, room string, stream pb.ChatServic
 			continue
 		}
 
-		hub.broadcast <- roomMessage{room: room, data: data}
+		hub.broadcast <- envelope{room: room, payload: data}
 	}
 }
 
