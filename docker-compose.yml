@@ -1,11 +1,14 @@
 services:
   chatservice:
-    build: ./chatservice
+    build:
+      context: .
+      dockerfile: ./chatservice/Dockerfile
     ports: ["50051:50051"]
   gateway:
-    build: ./gateway
+    build:
+      context: .
+      dockerfile: ./gateway/Dockerfile
     ports: ["8080:8080"]
+    environment:
+      CHAT_ADDR: chatservice:50051
     depends_on: [chatservice]
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
